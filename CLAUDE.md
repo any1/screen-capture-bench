@@ -12,6 +12,8 @@ This is a benchmark for screen capturing on Linux.
    - libdrm
    - vulkan
    - json-c
+   - libturbojpeg
+   - glslangValidator (build only, compiles the shaders)
 
 ### Buffer allocation
 
@@ -52,7 +54,23 @@ We want to test all combination of...
  * Use of shadow buffer vs. no shadow buffer.
  * Mapping using GBM vs. mapping via Vulkan.
 
-Impossible combinations shall be skipped.
+Impossible combinations are skipped:
 
-Each test shall be shown on stderr as it happens, and all the result should be
-printed as json to stdout in the end.
+ * GBM mapping with a shadow buffer.
+ * Vulkan mapping without a shadow buffer on a non-linear modifier (the
+   mapped tiled memory would be read back as garbage).
+ * Modifiers GBM cannot import (e.g. compressed/DCC).
+
+The modifier Vulkan considers optimal is detected and marked.
+
+## Metrics
+
+Per combination: frames, fps, CPU time and usage per frame, and the GPU time
+and usage of the Vulkan command buffer per frame (via timestamp queries; work
+inside gbm_bo_map is not visible to this).
+
+## Output
+
+Each test is shown on stderr as it happens. Results are printed as json to
+stdout, grouped by GPU. The fastest combination per GPU is printed to stderr at
+the end.
