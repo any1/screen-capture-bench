@@ -80,6 +80,10 @@ struct gpu {
 	char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
 	VkPhysicalDeviceMemoryProperties memprops;
 
+	/* GPU timestamp support, for measuring on-GPU time per frame. */
+	float timestamp_period;		/* nanoseconds per timestamp tick */
+	uint32_t timestamp_valid_bits;	/* 0 if timestamps are unsupported */
+
 	int drm_fd;
 	struct gbm_device *gbm;
 
@@ -116,6 +120,7 @@ struct target {
 	VkFramebuffer fb;
 	VkCommandBuffer cmd;
 	VkFence fence;
+	VkQueryPool qpool;	/* two timestamps: start/end of the frame */
 
 	VkSubresourceLayout layout;	/* plane 0 of the image */
 
@@ -137,6 +142,14 @@ static double now_sec(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* Process-wide consumed CPU time (user + system), for cpu-per-frame. */
+static double now_cpu_sec(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
 	return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
@@ -300,6 +313,7 @@ static bool gpu_init(struct gpu *g, VkPhysicalDevice phys,
 	for (uint32_t i = 0; i < nq; i++) {
 		if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
 			g->qfamily = i;
+			g->timestamp_valid_bits = qf[i].timestampValidBits;
 			have_q = true;
 			break;
 		}
@@ -307,6 +321,9 @@ static bool gpu_init(struct gpu *g, VkPhysicalDevice phys,
 	free(qf);
 	if (!have_q)
 		return false;
+
+	/* timestampPeriod is the same for the whole device. */
+	g->timestamp_period = props.limits.timestampPeriod;
 
 	/* Only enable the extensions that are actually present. */
 	const char *enabled[8];
@@ -758,6 +775,15 @@ static bool target_create(struct gpu *g, const struct options *opt,
 		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 	};
 	vkCreateFence(g->dev, &fci, NULL, &t->fence);
+
+	if (g->timestamp_valid_bits) {
+		VkQueryPoolCreateInfo qpci = {
+			.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+			.queryType = VK_QUERY_TYPE_TIMESTAMP,
+			.queryCount = 2,
+		};
+		vkCreateQueryPool(g->dev, &qpci, NULL, &t->qpool);
+	}
 	return true;
 }
 
@@ -776,6 +802,8 @@ static void target_destroy(struct gpu *g, struct target *t)
 		vkFreeMemory(g->dev, t->shadow_mem, NULL);
 	if (t->image_map)
 		vkUnmapMemory(g->dev, t->mem);
+	if (t->qpool)
+		vkDestroyQueryPool(g->dev, t->qpool, NULL);
 	if (t->fence)
 		vkDestroyFence(g->dev, t->fence, NULL);
 	if (t->fb)
@@ -804,6 +832,12 @@ static void record_frame(struct gpu *g, const struct options *opt,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
 	vkBeginCommandBuffer(t->cmd, &bi);
+
+	if (t->qpool) {
+		vkCmdResetQueryPool(t->cmd, t->qpool, 0, 2);
+		vkCmdWriteTimestamp(t->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				    t->qpool, 0);
+	}
 
 	VkClearValue clear = { .color = { .float32 = { 0.05f, 0.05f, 0.08f, 1.0f } } };
 	VkRenderPassBeginInfo rbi = {
@@ -853,6 +887,10 @@ static void record_frame(struct gpu *g, const struct options *opt,
 				     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
 				     NULL, 0, NULL);
 	}
+
+	if (t->qpool)
+		vkCmdWriteTimestamp(t->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+				    t->qpool, 1);
 
 	vkEndCommandBuffer(t->cmd);
 }
@@ -1017,8 +1055,16 @@ static struct json_object *run_test(const struct test_context *ctx,
 		tj = tjInitCompress();
 	}
 
+	/* Mask for the valid low bits of a timestamp, and microseconds per tick. */
+	uint64_t ts_mask = t.qpool && g->timestamp_valid_bits < 64
+				   ? ((uint64_t)1 << g->timestamp_valid_bits) - 1
+				   : UINT64_MAX;
+	double us_per_tick = g->timestamp_period / 1000.0;
+	double gpu_us_total = 0;
+
 	const float angle_step = (float)(2.0 * M_PI / 60.0);
 	double start = now_sec();
+	double cpu_start = now_cpu_sec();
 	uint64_t frame = 0;
 
 	while (now_sec() - start < opt->duration) {
@@ -1032,6 +1078,15 @@ static struct json_object *run_test(const struct test_context *ctx,
 		};
 		vkQueueSubmit(g->queue, 1, &si, t.fence);
 		vkWaitForFences(g->dev, 1, &t.fence, VK_TRUE, UINT64_MAX);
+
+		if (t.qpool) {
+			uint64_t ts[2];
+			if (vkGetQueryPoolResults(g->dev, t.qpool, 0, 2,
+						  sizeof(ts), ts, sizeof(ts[0]),
+						  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+				gpu_us_total += ((ts[1] & ts_mask) -
+						 (ts[0] & ts_mask)) * us_per_tick;
+		}
 
 		if (!capture_frame(g, opt, &t, map, shadow, host)) {
 			fprintf(stderr, "capture failed ... ");
@@ -1051,9 +1106,28 @@ static struct json_object *run_test(const struct test_context *ctx,
 		frame++;
 	}
 
+	double cpu_total = now_cpu_sec() - cpu_start;
 	double elapsed = now_sec() - start;
 	double fps = elapsed > 0 ? frame / elapsed : 0;
-	fprintf(stderr, "%" PRIu64 " frames, %.1f fps\n", frame, fps);
+	/* CPU time consumed per frame, and CPU usage as a share of wall time
+	 * (it can exceed 100% when the Vulkan driver uses worker threads). */
+	double cpu_us_per_frame = frame ? cpu_total * 1e6 / frame : 0;
+	double cpu_usage_percent = elapsed > 0 ? cpu_total / elapsed * 100 : 0;
+	/* GPU time spent in our Vulkan command buffer (the render, plus the
+	 * image->buffer copy on the shadow path), and the GPU usage it
+	 * represents as a share of wall time.  This does not cover work done
+	 * inside gbm_bo_map, which may detile on either the CPU or GPU and is
+	 * invisible to these queries. */
+	double vk_gpu_us_per_frame = frame ? gpu_us_total / frame : 0;
+	double vk_gpu_usage_percent =
+		elapsed > 0 ? gpu_us_total / (elapsed * 1e6) * 100 : 0;
+	if (t.qpool)
+		fprintf(stderr, "%" PRIu64 " frames, %.1f fps, %.1f us/frame cpu (%.0f%% cpu usage), %.1f us/frame vk-gpu (%.0f%% vk-gpu usage)\n",
+			frame, fps, cpu_us_per_frame, cpu_usage_percent,
+			vk_gpu_us_per_frame, vk_gpu_usage_percent);
+	else
+		fprintf(stderr, "%" PRIu64 " frames, %.1f fps, %.1f us/frame cpu (%.0f%% cpu usage)\n",
+			frame, fps, cpu_us_per_frame, cpu_usage_percent);
 
 	if (!best->valid || fps > best->fps) {
 		best->valid = true;
@@ -1063,6 +1137,8 @@ static struct json_object *run_test(const struct test_context *ctx,
 		best->map = map;
 		best->shadow = shadow;
 	}
+
+	bool measured_gpu = t.qpool != NULL;
 
 	if (tj)
 		tjDestroy(tj);
@@ -1074,6 +1150,16 @@ static struct json_object *run_test(const struct test_context *ctx,
 	json_object_object_add(o, "skipped", json_object_new_boolean(false));
 	json_object_object_add(o, "frames", json_object_new_int64((int64_t)frame));
 	json_object_object_add(o, "fps", json_object_new_double(fps));
+	json_object_object_add(o, "cpu_us_per_frame",
+			       json_object_new_double(cpu_us_per_frame));
+	json_object_object_add(o, "cpu_usage_percent",
+			       json_object_new_double(cpu_usage_percent));
+	if (measured_gpu) {
+		json_object_object_add(o, "vk_gpu_us_per_frame",
+				       json_object_new_double(vk_gpu_us_per_frame));
+		json_object_object_add(o, "vk_gpu_usage_percent",
+				       json_object_new_double(vk_gpu_usage_percent));
+	}
 	if (output[0])
 		json_object_object_add(o, "output", json_object_new_string(output));
 	return o;
