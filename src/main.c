@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 
@@ -1165,6 +1166,61 @@ static struct json_object *run_test(const struct test_context *ctx,
 	return o;
 }
 
+/* Read a single field's value from a "KEY=VALUE" or "key : value" file. */
+static void read_field(const char *path, const char *key, char prefix_char,
+		       char *out, size_t len)
+{
+	out[0] = '\0';
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+
+	size_t keylen = strlen(key);
+	char line[512];
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, key, keylen) != 0)
+			continue;
+		char *v = strchr(line + keylen, prefix_char);
+		if (!v)
+			break;
+		v++;
+		while (*v == ' ' || *v == '\t' || *v == '"')
+			v++;
+		v[strcspn(v, "\n")] = '\0';
+		char *end = v + strlen(v);
+		while (end > v && (end[-1] == '"' || end[-1] == ' '))
+			*--end = '\0';
+		snprintf(out, len, "%s", v);
+		break;
+	}
+	fclose(f);
+}
+
+static struct json_object *system_info(void)
+{
+	struct json_object *o = json_object_new_object();
+	char buf[256];
+
+	read_field("/etc/os-release", "PRETTY_NAME", '=', buf, sizeof(buf));
+	json_object_object_add(o, "distro", json_object_new_string(buf));
+
+	struct utsname u;
+	if (uname(&u) == 0) {
+		snprintf(buf, sizeof(buf), "%s %s", u.sysname, u.release);
+		json_object_object_add(o, "kernel", json_object_new_string(buf));
+	}
+
+	read_field("/proc/cpuinfo", "model name", ':', buf, sizeof(buf));
+	json_object_object_add(o, "cpu", json_object_new_string(buf));
+	json_object_object_add(o, "cpu_threads",
+			       json_object_new_int(sysconf(_SC_NPROCESSORS_ONLN)));
+
+	int64_t mem = (int64_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
+	json_object_object_add(o, "memory_bytes", json_object_new_int64(mem));
+
+	return o;
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
@@ -1235,7 +1291,10 @@ int main(int argc, char **argv)
 	vkEnumeratePhysicalDevices(inst, &ndev, devs);
 
 	/* The result JSON is assembled incrementally as the tests run. */
-	struct json_object *root = json_object_new_array();
+	struct json_object *root = json_object_new_object();
+	json_object_object_add(root, "system", system_info());
+	struct json_object *gpus = json_object_new_array();
+	json_object_object_add(root, "gpus", gpus);
 	struct best *bests = calloc(ndev, sizeof(*bests));
 
 	for (uint32_t i = 0; i < ndev; i++) {
@@ -1254,7 +1313,7 @@ int main(int argc, char **argv)
 				       json_object_new_string(g.name));
 		struct json_object *results = json_object_new_array();
 		json_object_object_add(gpu_obj, "results", results);
-		json_object_array_add(root, gpu_obj);
+		json_object_array_add(gpus, gpu_obj);
 
 		uint64_t mods[64];
 		uint32_t nmods = query_modifiers(&g, mods, 64);

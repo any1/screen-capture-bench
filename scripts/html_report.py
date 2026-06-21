@@ -119,7 +119,42 @@ def gpu_table_html(gpu):
 	return "\n".join(parts)
 
 
+def system_html(system):
+	"""Render the generic system information as a small table."""
+	if not system:
+		return ""
+
+	mem = system.get("memory_bytes")
+	mem_str = "%.1f GiB" % (mem / 1024**3) if mem else None
+	fields = [
+		("Distro", system.get("distro")),
+		("Kernel", system.get("kernel")),
+		("CPU", system.get("cpu")),
+		("Threads", system.get("cpu_threads")),
+		("Memory", mem_str),
+	]
+
+	parts = ["<h2>System</h2>",
+		 "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">"]
+	for label, value in fields:
+		if value in (None, ""):
+			continue
+		parts.append("<tr><th>%s</th><td>%s</td></tr>"
+			     % (label, html.escape(str(value))))
+	parts.append("</table>")
+	return "\n".join(parts)
+
+
 def build_report(data):
+	# The root is an object with system info and a list of GPUs; older
+	# output was a bare list of GPUs.
+	if isinstance(data, dict):
+		system = data.get("system", {})
+		gpus = data.get("gpus", [])
+	else:
+		system = {}
+		gpus = data
+
 	parts = [
 		"<!DOCTYPE html>",
 		"<html>",
@@ -131,7 +166,11 @@ def build_report(data):
 		"Empty cells are skipped combinations (hover for the reason).</p>",
 	]
 
-	for gpu in data:
+	system_section = system_html(system)
+	if system_section:
+		parts.append(system_section)
+
+	for gpu in gpus:
 		parts.append(gpu_table_html(gpu))
 
 	parts.append("</body>")
