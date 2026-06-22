@@ -297,6 +297,13 @@ static bool gpu_init(struct gpu *g, VkPhysicalDevice phys,
 	vkGetPhysicalDeviceProperties(phys, &props);
 	snprintf(g->name, sizeof(g->name), "%s", props.deviceName);
 
+	if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
+	    props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+		fprintf(stderr, "  GPU '%s' is not a hardware GPU, skipping\n",
+			g->name);
+		return false;
+	}
+
 	if (!dev_supports(phys, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)) {
 		fprintf(stderr, "  GPU '%s' lacks DRM format modifier support, skipping\n",
 			g->name);
