@@ -1228,6 +1228,46 @@ static struct json_object *system_info(void)
 	return o;
 }
 
+#define STR(x) #x
+#define XSTR(x) STR(x)
+
+#define MEMORY_PROPERTY_FLAGS(X) \
+	X(DEVICE_LOCAL_BIT) \
+	X(HOST_VISIBLE_BIT) \
+	X(HOST_COHERENT_BIT) \
+	X(HOST_CACHED_BIT) \
+	X(LAZILY_ALLOCATED_BIT) \
+	X(PROTECTED_BIT) \
+	X(DEVICE_COHERENT_BIT_AMD) \
+	X(DEVICE_UNCACHED_BIT_AMD) \
+	X(RDMA_CAPABLE_BIT_NV)
+
+static struct json_object *memory_types_json(const VkPhysicalDeviceMemoryProperties *mp)
+{
+	struct json_object *arr = json_object_new_array();
+	for (uint32_t i = 0; i < mp->memoryTypeCount; i++) {
+		VkMemoryPropertyFlags pf = mp->memoryTypes[i].propertyFlags;
+
+		struct json_object *o = json_object_new_object();
+		json_object_object_add(o, "index", json_object_new_int((int)i));
+		json_object_object_add(o, "heap",
+			json_object_new_int((int)mp->memoryTypes[i].heapIndex));
+
+		struct json_object *props = json_object_new_array();
+#define X(name) \
+		if (pf & VK_MEMORY_PROPERTY_##name) \
+			json_object_array_add(props, \
+				json_object_new_string(XSTR(name)));
+		MEMORY_PROPERTY_FLAGS(X)
+#undef X
+		json_object_object_add(o, "properties", props);
+		json_object_array_add(arr, o);
+	}
+	return arr;
+}
+
+#undef MEMORY_PROPERTY_FLAGS
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
@@ -1318,6 +1358,8 @@ int main(int argc, char **argv)
 		struct json_object *gpu_obj = json_object_new_object();
 		json_object_object_add(gpu_obj, "gpu",
 				       json_object_new_string(g.name));
+		json_object_object_add(gpu_obj, "memory_types",
+				       memory_types_json(&g.memprops));
 		struct json_object *results = json_object_new_array();
 		json_object_object_add(gpu_obj, "results", results);
 		json_object_array_add(gpus, gpu_obj);

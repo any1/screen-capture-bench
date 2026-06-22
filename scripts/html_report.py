@@ -94,6 +94,24 @@ def cell_html(result):
 	return "<td>%.1f</td>" % fps
 
 
+def memory_types_html(memory_types):
+	"""Render the device's Vulkan memory types and their property bits."""
+	if not memory_types:
+		return ""
+
+	parts = ["<h3>Memory types</h3>",
+		 "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">",
+		 "<tr><th>Index</th><th>Heap</th><th>Properties</th></tr>"]
+	for mt in memory_types:
+		props = ", ".join(mt.get("properties", []))
+		parts.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
+			     % (html.escape(str(mt.get("index", "?"))),
+				html.escape(str(mt.get("heap", "?"))),
+				html.escape(props)))
+	parts.append("</table>")
+	return "\n".join(parts)
+
+
 def gpu_table_html(gpu):
 	name = html.escape(gpu.get("gpu", "Unknown GPU"))
 	results = gpu.get("results", [])
@@ -102,6 +120,10 @@ def gpu_table_html(gpu):
 	index = build_cell_index(results)
 
 	parts = ["<h2>%s</h2>" % name]
+	memory_section = memory_types_html(gpu.get("memory_types", []))
+	if memory_section:
+		parts.append(memory_section)
+	parts.append("<h3>Benchmark</h3>")
 	parts.append("<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">")
 
 	header = ["<th>Modifier</th>"]
