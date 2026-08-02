@@ -86,6 +86,7 @@ struct gpu {
 	uint32_t timestamp_valid_bits;	/* 0 if timestamps are unsupported */
 
 	int drm_fd;
+	char *drm_node;		/* render node path, NULL if not identified */
 	struct gbm_device *gbm;
 
 	/* Re-used rendering resources (depend only on the format / size). */
@@ -212,7 +213,10 @@ static bool dev_supports(VkPhysicalDevice phys, const char *ext)
 	return found;
 }
 
-static int open_drm_render_node(VkPhysicalDevice phys)
+/* Returns NULL when Vulkan does not tell us which node the device is, i.e. when
+ * VK_EXT_physical_device_drm is unavailable.
+ */
+static char *find_drm_render_node(VkPhysicalDevice phys)
 {
 	VkPhysicalDeviceDrmPropertiesEXT drmp = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
@@ -232,13 +236,12 @@ static int open_drm_render_node(VkPhysicalDevice phys)
 					 "/dev/dri/renderD%d", i);
 				struct stat st;
 				if (stat(path, &st) == 0 && st.st_rdev == want)
-					return open(path, O_RDWR | O_CLOEXEC);
+					return strdup(path);
 			}
 		}
 	}
 
-	/* Fallback: just grab the first render node. */
-	return open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+	return NULL;
 }
 
 static VkShaderModule make_shader(VkDevice dev, const uint32_t *code, size_t len)
@@ -368,7 +371,10 @@ static bool gpu_init(struct gpu *g, VkPhysicalDevice phys,
 		vkGetDeviceProcAddr(g->dev, "vkGetImageDrmFormatModifierPropertiesEXT");
 
 	/* DRM render node + GBM device (used for the GBM mapping path). */
-	g->drm_fd = open_drm_render_node(phys);
+	g->drm_node = find_drm_render_node(phys);
+	/* Fallback: just grab the first render node. */
+	g->drm_fd = open(g->drm_node ? g->drm_node : "/dev/dri/renderD128",
+			 O_RDWR | O_CLOEXEC);
 	if (g->drm_fd >= 0)
 		g->gbm = gbm_create_device(g->drm_fd);
 	if (!g->gbm)
@@ -493,6 +499,7 @@ static void gpu_finish(struct gpu *g)
 		gbm_device_destroy(g->gbm);
 	if (g->drm_fd >= 0)
 		close(g->drm_fd);
+	free(g->drm_node);
 }
 
 /*
@@ -1268,6 +1275,91 @@ static struct json_object *memory_types_json(const VkPhysicalDeviceMemoryPropert
 
 #undef MEMORY_PROPERTY_FLAGS
 
+static void add_drm_bus_json(struct json_object *o, drmDevicePtr dev)
+{
+	const char *bus_type = NULL;
+	char id[DRM_PLATFORM_DEVICE_NAME_LEN] = "";
+
+	switch (dev->bustype) {
+	case DRM_BUS_PCI:
+		bus_type = "pci";
+		snprintf(id, sizeof(id), "%04x:%04x",
+			 dev->deviceinfo.pci->vendor_id,
+			 dev->deviceinfo.pci->device_id);
+		break;
+	case DRM_BUS_USB:
+		bus_type = "usb";
+		snprintf(id, sizeof(id), "%04x:%04x",
+			 dev->deviceinfo.usb->vendor,
+			 dev->deviceinfo.usb->product);
+		break;
+	case DRM_BUS_PLATFORM:
+		bus_type = "platform";
+		/* The first entry is the most specific compatible string. */
+		if (dev->deviceinfo.platform->compatible &&
+		    dev->deviceinfo.platform->compatible[0])
+			snprintf(id, sizeof(id), "%s",
+				 dev->deviceinfo.platform->compatible[0]);
+		else
+			snprintf(id, sizeof(id), "%s",
+				 dev->businfo.platform->fullname);
+		break;
+	case DRM_BUS_HOST1X:
+		bus_type = "host1x";
+		if (dev->deviceinfo.host1x->compatible &&
+		    dev->deviceinfo.host1x->compatible[0])
+			snprintf(id, sizeof(id), "%s",
+				 dev->deviceinfo.host1x->compatible[0]);
+		else
+			snprintf(id, sizeof(id), "%s",
+				 dev->businfo.host1x->fullname);
+		break;
+#ifdef DRM_BUS_FAUX
+	case DRM_BUS_FAUX:
+		bus_type = "faux";
+		snprintf(id, sizeof(id), "%s", dev->businfo.faux->name);
+		break;
+#endif
+	}
+
+	if (!bus_type)
+		return;
+
+	json_object_object_add(o, "bus_type", json_object_new_string(bus_type));
+	if (id[0])
+		json_object_object_add(o, "device_id",
+				       json_object_new_string(id));
+}
+
+static void add_drm_identity_json(struct json_object *o, int drm_fd)
+{
+	drmVersionPtr ver = drmGetVersion(drm_fd);
+	if (ver) {
+		json_object_object_add(o, "driver",
+				       json_object_new_string(ver->name));
+
+		char version[64];
+		snprintf(version, sizeof(version), "%d.%d.%d",
+			 ver->version_major, ver->version_minor,
+			 ver->version_patchlevel);
+		json_object_object_add(o, "driver_version",
+				       json_object_new_string(version));
+
+		/* Drivers that don't maintain a date report "0". */
+		if (ver->date && ver->date[0] && strcmp(ver->date, "0") != 0)
+			json_object_object_add(o, "driver_date",
+					       json_object_new_string(ver->date));
+
+		drmFreeVersion(ver);
+	}
+
+	drmDevicePtr dev = NULL;
+	if (drmGetDevice2(drm_fd, 0, &dev) == 0) {
+		add_drm_bus_json(o, dev);
+		drmFreeDevice(&dev);
+	}
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
@@ -1358,6 +1450,11 @@ int main(int argc, char **argv)
 		struct json_object *gpu_obj = json_object_new_object();
 		json_object_object_add(gpu_obj, "gpu",
 				       json_object_new_string(g.name));
+		/* Without a render node identified by Vulkan we fell back to the
+		 * first one, which may well belong to another of the GPUs.
+		 */
+		if (g.drm_fd >= 0 && (g.drm_node || ndev == 1))
+			add_drm_identity_json(gpu_obj, g.drm_fd);
 		json_object_object_add(gpu_obj, "memory_types",
 				       memory_types_json(&g.memprops));
 		struct json_object *results = json_object_new_array();
