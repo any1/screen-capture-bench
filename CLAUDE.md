@@ -59,7 +59,7 @@ Impossible combinations are skipped:
  * GBM mapping with a shadow buffer.
  * Vulkan mapping without a shadow buffer on a non-linear modifier (the
    mapped tiled memory would be read back as garbage).
- * Modifiers GBM cannot import (e.g. compressed/DCC).
+ * Modifiers GBM cannot import.
 
 The modifier Vulkan considers optimal is detected and marked.
 

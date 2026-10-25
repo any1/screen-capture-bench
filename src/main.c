@@ -124,7 +124,8 @@ struct target {
 	VkFence fence;
 	VkQueryPool qpool;	/* two timestamps: start/end of the frame */
 
-	VkSubresourceLayout layout;	/* plane 0 of the image */
+	uint32_t plane_count;
+	VkSubresourceLayout layouts[GBM_MAX_PLANES];	/* memory planes of the image */
 
 	/* Vulkan mapping (no shadow): persistent map of the image memory. */
 	void *image_map;
@@ -534,6 +535,33 @@ static uint32_t query_modifiers(struct gpu *g, uint64_t *out, uint32_t max)
 	return n;
 }
 
+static uint32_t modifier_plane_count(struct gpu *g, uint64_t modifier)
+{
+	VkDrmFormatModifierPropertiesListEXT list = {
+		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+	};
+	VkFormatProperties2 fp = {
+		.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+		.pNext = &list,
+	};
+	vkGetPhysicalDeviceFormatProperties2(g->phys, VK_FMT, &fp);
+	if (list.drmFormatModifierCount == 0)
+		return 0;
+
+	VkDrmFormatModifierPropertiesEXT *props =
+		calloc(list.drmFormatModifierCount, sizeof(*props));
+	list.pDrmFormatModifierProperties = props;
+	vkGetPhysicalDeviceFormatProperties2(g->phys, VK_FMT, &fp);
+
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < list.drmFormatModifierCount; i++) {
+		if (props[i].drmFormatModifier == modifier)
+			count = props[i].drmFormatModifierPlaneCount;
+	}
+	free(props);
+	return count;
+}
+
 /*
  * Determine which modifier the implementation considers optimal: create an
  * image offering the whole candidate list and let the driver pick, then read
@@ -654,10 +682,21 @@ static bool create_image(struct gpu *g, const struct options *opt,
 	t->mem_coherent = (g->memprops.memoryTypes[mt].propertyFlags &
 			   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 
-	VkImageSubresource sub = {
-		.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
+	static const VkImageAspectFlagBits plane_aspects[GBM_MAX_PLANES] = {
+		VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
+		VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT,
+		VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT,
+		VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT,
 	};
-	vkGetImageSubresourceLayout(g->dev, t->image, &sub, &t->layout);
+	t->plane_count = modifier_plane_count(g, modifier);
+	if (t->plane_count == 0 || t->plane_count > GBM_MAX_PLANES)
+		return false;
+	for (uint32_t i = 0; i < t->plane_count; i++) {
+		VkImageSubresource sub = {
+			.aspectMask = plane_aspects[i],
+		};
+		vkGetImageSubresourceLayout(g->dev, t->image, &sub, &t->layouts[i]);
+	}
 	return true;
 }
 
@@ -711,12 +750,14 @@ static bool import_gbm(struct gpu *g, const struct options *opt,
 		.width = opt->width,
 		.height = opt->height,
 		.format = DRM_FMT,
-		.num_fds = 1,
-		.fds[0] = t->dmabuf_fd,
-		.strides[0] = (int)t->layout.rowPitch,
-		.offsets[0] = (int)t->layout.offset,
+		.num_fds = t->plane_count,
 		.modifier = modifier,
 	};
+	for (uint32_t i = 0; i < t->plane_count; i++) {
+		data.fds[i] = t->dmabuf_fd;
+		data.strides[i] = (int)t->layouts[i].rowPitch;
+		data.offsets[i] = (int)t->layouts[i].offset;
+	}
 	t->bo = gbm_bo_import(g->gbm, GBM_BO_IMPORT_FD_MODIFIER, &data,
 			      GBM_BO_USE_RENDERING);
 	return t->bo != NULL;
@@ -943,8 +984,8 @@ static bool capture_frame(struct gpu *g, const struct options *opt,
 			};
 			vkInvalidateMappedMemoryRanges(g->dev, 1, &r);
 		}
-		src = (const uint8_t *)t->image_map + t->layout.offset;
-		src_pitch = t->layout.rowPitch;
+		src = (const uint8_t *)t->image_map + t->layouts[0].offset;
+		src_pitch = t->layouts[0].rowPitch;
 		for (uint32_t y = 0; y < h; y++)
 			memcpy(dst + y * dst_pitch, src + (size_t)y * src_pitch,
 			       dst_pitch);
@@ -1029,7 +1070,7 @@ static struct json_object *run_test(const struct test_context *ctx,
 		target_destroy(g, &t);
 		const char *reason;
 		if (map == MAP_GBM)
-			reason = "modifier not importable via gbm (e.g. compressed/DCC)";
+			reason = "modifier not importable via gbm";
 		else if (map == MAP_VULKAN && !shadow)
 			reason = "image memory is not host visible";
 		else
