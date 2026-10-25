@@ -951,6 +951,18 @@ static void record_frame(struct gpu *g, const struct options *opt,
 	vkEndCommandBuffer(t->cmd);
 }
 
+static void copy_rows(uint8_t *dst, size_t dst_pitch, const uint8_t *src,
+		      size_t src_pitch, uint32_t h)
+{
+	if (src_pitch == dst_pitch) {
+		memcpy(dst, src, dst_pitch * h);
+		return;
+	}
+	for (uint32_t y = 0; y < h; y++)
+		memcpy(dst + y * dst_pitch, src + (size_t)y * src_pitch,
+		       dst_pitch);
+}
+
 /* Copy the rendered frame into the host buffer.  Returns false on error. */
 static bool capture_frame(struct gpu *g, const struct options *opt,
 			  struct target *t, enum mapping_method map,
@@ -970,9 +982,7 @@ static bool capture_frame(struct gpu *g, const struct options *opt,
 			return false;
 		src = data;
 		src_pitch = stride;
-		for (uint32_t y = 0; y < h; y++)
-			memcpy(dst + y * dst_pitch, src + (size_t)y * src_pitch,
-			       dst_pitch);
+		copy_rows(dst, dst_pitch, src, src_pitch, h);
 		gbm_bo_unmap(t->bo, bo_map);
 	} else if (!shadow) {
 		if (!t->mem_coherent) {
@@ -986,9 +996,7 @@ static bool capture_frame(struct gpu *g, const struct options *opt,
 		}
 		src = (const uint8_t *)t->image_map + t->layouts[0].offset;
 		src_pitch = t->layouts[0].rowPitch;
-		for (uint32_t y = 0; y < h; y++)
-			memcpy(dst + y * dst_pitch, src + (size_t)y * src_pitch,
-			       dst_pitch);
+		copy_rows(dst, dst_pitch, src, src_pitch, h);
 	} else {
 		if (!t->shadow_coherent) {
 			VkMappedMemoryRange r = {
